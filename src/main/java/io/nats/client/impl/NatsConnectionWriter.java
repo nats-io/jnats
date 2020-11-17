@@ -15,9 +15,8 @@ package io.nats.client.impl;
 
 import java.io.IOException;
 import java.nio.BufferOverflowException;
-import java.nio.charset.StandardCharsets;
+import java.nio.ByteBuffer;
 import java.time.Duration;
-import java.util.Arrays;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
@@ -37,7 +36,8 @@ class NatsConnectionWriter implements Runnable {
     private final AtomicBoolean reconnectMode;
     private final ReentrantLock startStopLock;
 
-    private byte[] sendBuffer;
+    private ByteBuffer accumulateBuffer;
+    private ByteBuffer sendBuffer;
 
     private MessageQueue outgoing;
     private MessageQueue reconnectOutgoing;
@@ -53,7 +53,8 @@ class NatsConnectionWriter implements Runnable {
 
         Options options = connection.getOptions();
         int bufSize = options.getBufferSize();
-        this.sendBuffer = new byte[bufSize];
+        this.accumulateBuffer = ByteBuffer.allocateDirect(bufSize);
+        this.sendBuffer = ByteBuffer.allocateDirect(bufSize);
         
         outgoing = new MessageQueue(true,
             options.getMaxMessagesInOutgoingQueue(),
@@ -89,11 +90,8 @@ class NatsConnectionWriter implements Runnable {
                 this.outgoing.pause();
                 this.reconnectOutgoing.pause();
                 // Clear old ping/pong requests
-                byte[] pingRequest = NatsConnection.OP_PING.getBytes(StandardCharsets.UTF_8);
-                byte[] pongRequest = NatsConnection.OP_PONG.getBytes(StandardCharsets.UTF_8);
-
                 this.outgoing.filter((msg) -> {
-                    return Arrays.equals(pingRequest, msg.getProtocolBytes()) || Arrays.equals(pongRequest, msg.getProtocolBytes());
+                    return NatsConnection.OP_PING.equals(msg.getProtocolBytes()) || NatsConnection.OP_PONG.equals(msg.getProtocolBytes());
                 });
 
         } finally {
@@ -107,6 +105,7 @@ class NatsConnectionWriter implements Runnable {
     public void run() {
         Duration waitForMessage = Duration.ofMinutes(2); // This can be long since no one is sending
         Duration reconnectWait = Duration.ofMillis(1); // This should be short, since we are trying to get the reconnect through
+        CompletableFuture<Integer> writeFut = null;
 
         try {
             DataPort dataPort = this.dataPortFuture.get(); // Will wait for the future to complete
@@ -114,13 +113,12 @@ class NatsConnectionWriter implements Runnable {
             int maxAccumulate = Options.MAX_MESSAGES_IN_NETWORK_BUFFER;
 
             while (this.running.get()) {
-                int sendPosition = 0;
                 NatsMessage msg = null;
                 
                 if (this.reconnectMode.get()) {
-                    msg = this.reconnectOutgoing.accumulate(this.sendBuffer.length, maxAccumulate, reconnectWait);
+                    msg = this.reconnectOutgoing.accumulate(this.accumulateBuffer.remaining(), maxAccumulate, reconnectWait);
                 } else {
-                    msg = this.outgoing.accumulate(this.sendBuffer.length, maxAccumulate, waitForMessage);
+                    msg = this.outgoing.accumulate(this.accumulateBuffer.remaining(), maxAccumulate, waitForMessage);
                 }
 
                 if (msg == null) { // Make sure we are still running
@@ -130,36 +128,36 @@ class NatsConnectionWriter implements Runnable {
                 while (msg != null) {
                     long size = msg.getSizeInBytes();
 
-                    if (sendPosition + size > sendBuffer.length) {
-                        if (sendPosition == 0) { // have to resize
-                            this.sendBuffer = new byte[(int)Math.max(sendBuffer.length + size, sendBuffer.length * 2)];
+                    if (size > accumulateBuffer.remaining()) {
+                        if (accumulateBuffer.position() == 0) { // have to resize
+                            this.accumulateBuffer = ByteBuffer.allocateDirect((int)Math.max(accumulateBuffer.capacity() + size, accumulateBuffer.capacity() * 2));
                         } else { // else send and go to next message
-                            dataPort.write(sendBuffer, sendPosition);
-                            connection.getNatsStatistics().registerWrite(sendPosition);
-                            sendPosition = 0;
+                            if (writeFut != null) {
+                                if (writeFut.get() < 0)
+                                    throw new IOException("Write channel closed.");
+                                while (this.sendBuffer.hasRemaining()) {
+                                    if (dataPort.write(this.sendBuffer).get() < 0)
+                                        throw new IOException("Write channel closed.");
+                                }
+                                connection.getNatsStatistics().registerWrite(this.sendBuffer.position());
+                            }
+                            ByteBuffer sendTmp = this.sendBuffer;
+                            this.sendBuffer = this.accumulateBuffer;
+                            this.accumulateBuffer = sendTmp;
+                            this.sendBuffer.flip();
+                            writeFut = dataPort.write(this.sendBuffer);
+                            this.accumulateBuffer.clear();
                             msg = msg.next;
 
                             if (msg == null) {
                                 break;
+                            } else {
+                                continue;
                             }
                         }
                     }
 
-                    byte[] bytes = msg.getProtocolBytes();
-                    System.arraycopy(bytes, 0, sendBuffer, sendPosition, bytes.length);
-                    sendPosition += bytes.length;
-
-                    sendBuffer[sendPosition++] = '\r';
-                    sendBuffer[sendPosition++] = '\n';
-
-                    if (!msg.isProtocol()) {
-                        bytes = msg.getData();
-                        System.arraycopy(bytes, 0, sendBuffer, sendPosition, bytes.length);
-                        sendPosition += bytes.length;
-
-                        sendBuffer[sendPosition++] = '\r';
-                        sendBuffer[sendPosition++] = '\n';
-                    }
+                    accumulateBuffer.put(msg.getMessageBuffer().asReadOnlyBuffer());
 
                     stats.incrementOutMsgs();
                     stats.incrementOutBytes(size);
@@ -167,15 +165,46 @@ class NatsConnectionWriter implements Runnable {
                     msg = msg.next;
                 }
 
-                dataPort.write(sendBuffer, sendPosition);
-                connection.getNatsStatistics().registerWrite(sendPosition);
+                if (writeFut != null) {
+                    if (writeFut.get() < 0)
+                        throw new IOException("Write channel closed.");
+                    while (this.sendBuffer.hasRemaining()) {
+                        if (dataPort.write(this.sendBuffer).get() < 0)
+                            throw new IOException("Write channel closed.");
+                    }
+                    connection.getNatsStatistics().registerWrite(this.sendBuffer.position());
+                }
+                ByteBuffer sendTmp = this.sendBuffer;
+                this.sendBuffer = this.accumulateBuffer;
+                this.accumulateBuffer = sendTmp;
+                this.sendBuffer.flip();
+                writeFut = dataPort.write(this.sendBuffer);
+                this.accumulateBuffer.clear();
             }
-        } catch (IOException | BufferOverflowException io) {
+            if (writeFut != null) {
+                if (writeFut.get() < 0)
+                    throw new IOException("Write channel closed.");
+                while (this.sendBuffer.hasRemaining()) {
+                    if (dataPort.write(this.sendBuffer).get() < 0)
+                        throw new IOException("Write channel closed.");
+                }
+                connection.getNatsStatistics().registerWrite(sendBuffer.position());
+            }
+        } catch (IOException io) {
             this.connection.handleCommunicationIssue(io);
-        } catch (CancellationException | ExecutionException | InterruptedException ex) {
+        } catch (ExecutionException ex) {
+            final Throwable cause = ex.getCause();
+            if (cause instanceof IOException) {
+                this.connection.handleCommunicationIssue((IOException) cause);
+            }
+        } catch (BufferOverflowException io) {
+            this.connection.handleCommunicationIssue(io);
+        } catch (CancellationException | InterruptedException ex) {
             // Exit
         } finally {
             this.running.set(false);
+            this.accumulateBuffer.clear();
+            this.sendBuffer.clear();
         }
     }
 
