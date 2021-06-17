@@ -20,14 +20,12 @@ class NatsConnectionWriter implements Runnable {
     private final NatsConnectionWriterImpl impl;
 
     NatsConnectionWriter(NatsConnection connection) {
-        String implName = System.getProperty("NatsConnectionWriterImplName");
-
-        if ("NatsConnectionWriterQueueImpl".equals(implName)) {
-            impl = new NatsConnectionWriterQueueImpl(connection);
-        }
-        else {
-            impl = new NatsConnectionWriterLatchImpl(connection);
-        }
+//        String implName = System.getProperty("NatsConnectionWriterImplName");
+          impl = new NatsConnectionWriterQueueImpl(connection);
+//        impl = new NatsConnectionWriterLatchImpl(connection);
+//        impl = new NatsConnectionWriterReentrantImpl(connection);
+//        impl = new NatsConnectionWriterWaitImpl(connection);
+//        impl = new NatsConnectionWriterLatch2Impl(connection);
     }
 
     // Should only be called if the current thread has exited.

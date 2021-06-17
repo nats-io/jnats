@@ -49,7 +49,8 @@ public class NatsAutoBench {
         // args = "small PubOnly".split(" ");
         // args = "med JsPubAsync".split(" ");
         // args = "help".split(" ");
-        // args = "latency large".split(" ");
+//        System.setProperty("NatsConnectionWriterImplName", "NatsConnectionWriterQueueImpl");
+         args = "latency large".split(" ");
 
         Arguments a = readArgs(args);
 

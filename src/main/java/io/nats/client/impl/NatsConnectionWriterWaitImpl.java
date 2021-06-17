@@ -17,28 +17,33 @@ import io.nats.client.Options;
 import io.nats.client.support.ByteArrayBuilder;
 
 import java.io.IOException;
-import java.util.concurrent.*;
+import java.nio.BufferOverflowException;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReentrantLock;
 
-public class NatsConnectionWriterLatchImpl extends NatsConnectionWriterImpl {
+public class NatsConnectionWriterWaitImpl extends NatsConnectionWriterImpl {
 
-    private static final int LATCH_AWAIT_INCREMENT = 1000;
-    private static final int LATCH_AWAIT_MAX = 60000;
     private static final int LATCH_COUNT = 1;
-    private static final int MAX_ROUNDS_NO_MESSAGES = 500_000;
+
+    private static final int TOTAL_SLEEP = 40;
+    private static final int EACH_SLEEP = 4;
+    private static final int MAX_BEFORE_FLUSH = 10;
 
     private final ByteArrayBuilder regularSendBuffer;
     private final ByteArrayBuilder reconnectSendBuffer;
     private final int discardMessageCountThreshold;
 
+    private final ReentrantLock lock;
     private long regularQueuedMessageCount;
     private long reconnectQueuedMessageCount;
 
-    private final ReentrantLock lock;
     private final AtomicReference<CountDownLatch> latchRef;
 
-    NatsConnectionWriterLatchImpl(NatsConnection connection) {
+    NatsConnectionWriterWaitImpl(NatsConnection connection) {
         super(connection);
 
         Options options = connection.getOptions();
@@ -83,54 +88,49 @@ public class NatsConnectionWriterLatchImpl extends NatsConnectionWriterImpl {
     public void run() {
         try {
             dataPort = dataPortFuture.get(); // Will wait for the future to complete
-
-            // -----
-            // The choice to use a countdown latch was because it afforded both
-            // a count to wait for and the ability to not wait indefinitely so as
-            // not to get frozen waiting.
-            // -----
-
+            // --------------------------------------------------------------------------------
+            // NOTE
+            // --------------------------------------------------------------------------------
+            // regularQueuedMessageCount/reconnectQueuedMessageCount are volatile variables
+            // that are read in this method outside of the buffersAccessLock.lock() block.
+            // They are written to inside the _queue method, inside of a lock.
+            // Since we are reading, if we happen to miss a write, we don't care, as the loop
+            // will just check (read) those variables again soon.
+            // --------------------------------------------------------------------------------
+            int waits = 0;
             while (running.get()) {
-                //noinspection ResultOfMethodCallIgnored
-                latchRef.get().await(LATCH_AWAIT_INCREMENT, TimeUnit.MILLISECONDS);
+                boolean rmode = reconnectMode.get();
+                long mcount = rmode ? reconnectQueuedMessageCount : regularQueuedMessageCount;
 
-                int roundsWithoutMessages = 0;
-                while (++roundsWithoutMessages < MAX_ROUNDS_NO_MESSAGES) {
-                    boolean rmode = reconnectMode.get();
-                    long mcount = rmode ? reconnectQueuedMessageCount : regularQueuedMessageCount;
-                    while (mcount > 0) {
-
-                        // lock to have access to the buffers
-                        lock.lock();
-                        try {
-                            ByteArrayBuilder bab = rmode ? reconnectSendBuffer : regularSendBuffer;
-                            int byteCount = bab.length();
-                            dataPort.write(bab.internalArray(), byteCount);
-                            bab.clear();
-                            connection.getNatsStatistics().registerWrite(byteCount);
-                            if (rmode) {
-                                reconnectQueuedMessageCount = 0;
-                            } else {
-                                regularQueuedMessageCount = 0;
-                            }
-                        } catch (IOException io) {
-                            connection.handleCommunicationIssue(io);
-                        } finally {
-                            lock.unlock();
-                        }
-
-                        // we got messages, so reset these
-                        roundsWithoutMessages = 0;
-
-                        // check the count again
-                        mcount = rmode ? reconnectQueuedMessageCount : regularQueuedMessageCount;
-                    }
+                while (waits < TOTAL_SLEEP && mcount < MAX_BEFORE_FLUSH) {
+                    try { //noinspection BusyWait
+                        Thread.sleep(EACH_SLEEP);
+                    } catch (Exception ignore) { /* don't care */ }
+                    waits += EACH_SLEEP;
                 }
 
-                latchRef.set(new CountDownLatch(LATCH_COUNT));
+                if (mcount > 0) {
+                    lock.lock();
+                    try {
+                        ByteArrayBuilder bab = rmode ? reconnectSendBuffer : regularSendBuffer;
+                        int byteCount = bab.length();
+                        dataPort.write(bab.internalArray(), byteCount);
+                        bab.clear();
+                        connection.getNatsStatistics().registerWrite(byteCount);
+                        if (rmode) {
+                            reconnectQueuedMessageCount = 0;
+                        }
+                        else {
+                            regularQueuedMessageCount = 0;
+                        }
+                    } finally {
+                        lock.unlock();
+                    }
+                }
             }
+        } catch (IOException | BufferOverflowException io) {
+            connection.handleCommunicationIssue(io);
         } catch (CancellationException | ExecutionException | InterruptedException ex) {
-            System.out.println(ex);
             // Exit
         } finally {
             running.set(false);
@@ -159,9 +159,9 @@ public class NatsConnectionWriterLatchImpl extends NatsConnectionWriterImpl {
     }
 
     void _queue(NatsMessage msg, ByteArrayBuilder bab) {
+
         lock.lock();
         try {
-            //last message not consumed, wait for it be consumed
             long startSize = bab.length();
             msg.appendSerialized(bab);
             long added = bab.length() - startSize;
@@ -175,8 +175,8 @@ public class NatsConnectionWriterLatchImpl extends NatsConnectionWriterImpl {
             }
 
             connection.getNatsStatistics().incrementOutMsgsAndBytes(added);
-            latchRef.get().countDown();
-        } finally {
+        }
+        finally {
             lock.unlock();
         }
     }

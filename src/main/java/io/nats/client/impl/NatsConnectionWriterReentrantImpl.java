@@ -17,16 +17,15 @@ import io.nats.client.Options;
 import io.nats.client.support.ByteArrayBuilder;
 
 import java.io.IOException;
-import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicReference;
+import java.nio.BufferOverflowException;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
-public class NatsConnectionWriterLatchImpl extends NatsConnectionWriterImpl {
-
-    private static final int LATCH_AWAIT_INCREMENT = 1000;
-    private static final int LATCH_AWAIT_MAX = 60000;
-    private static final int LATCH_COUNT = 1;
-    private static final int MAX_ROUNDS_NO_MESSAGES = 500_000;
+public class NatsConnectionWriterReentrantImpl extends NatsConnectionWriterImpl {
 
     private final ByteArrayBuilder regularSendBuffer;
     private final ByteArrayBuilder reconnectSendBuffer;
@@ -35,10 +34,12 @@ public class NatsConnectionWriterLatchImpl extends NatsConnectionWriterImpl {
     private long regularQueuedMessageCount;
     private long reconnectQueuedMessageCount;
 
-    private final ReentrantLock lock;
-    private final AtomicReference<CountDownLatch> latchRef;
+    private boolean lockFlag;
+    private final Lock lock;
+    private final Condition producerFinished;
+    private final Condition consumerFinished;
 
-    NatsConnectionWriterLatchImpl(NatsConnection connection) {
+    NatsConnectionWriterReentrantImpl(NatsConnection connection) {
         super(connection);
 
         Options options = connection.getOptions();
@@ -52,8 +53,10 @@ public class NatsConnectionWriterLatchImpl extends NatsConnectionWriterImpl {
         regularQueuedMessageCount = 0;
         reconnectQueuedMessageCount = 0;
 
+        lockFlag = false;
         lock = new ReentrantLock();
-        latchRef = new AtomicReference<>(new CountDownLatch(LATCH_COUNT));
+        producerFinished = lock.newCondition();
+        consumerFinished = lock.newCondition();
     }
 
     // Should only be called if the current thread has exited.
@@ -75,7 +78,13 @@ public class NatsConnectionWriterLatchImpl extends NatsConnectionWriterImpl {
     // method does.
     Future<Boolean> stop() {
         this.running.set(false);
-        latchRef.get().countDown();
+        lock.lock();
+        try {
+            lockFlag = true;
+            producerFinished.signal();
+        } finally {
+            lock.unlock();
+        }
         return this.stopped;
     }
 
@@ -83,52 +92,43 @@ public class NatsConnectionWriterLatchImpl extends NatsConnectionWriterImpl {
     public void run() {
         try {
             dataPort = dataPortFuture.get(); // Will wait for the future to complete
-
-            // -----
-            // The choice to use a countdown latch was because it afforded both
-            // a count to wait for and the ability to not wait indefinitely so as
-            // not to get frozen waiting.
-            // -----
-
             while (running.get()) {
-                //noinspection ResultOfMethodCallIgnored
-                latchRef.get().await(LATCH_AWAIT_INCREMENT, TimeUnit.MILLISECONDS);
+                lock.lock();
+                try {
+                    //no new message wait for new message
+                    while (!lockFlag) {
+                        producerFinished.await();
+                    }
 
-                int roundsWithoutMessages = 0;
-                while (++roundsWithoutMessages < MAX_ROUNDS_NO_MESSAGES) {
                     boolean rmode = reconnectMode.get();
                     long mcount = rmode ? reconnectQueuedMessageCount : regularQueuedMessageCount;
-                    while (mcount > 0) {
-
-                        // lock to have access to the buffers
-                        lock.lock();
-                        try {
-                            ByteArrayBuilder bab = rmode ? reconnectSendBuffer : regularSendBuffer;
-                            int byteCount = bab.length();
-                            dataPort.write(bab.internalArray(), byteCount);
-                            bab.clear();
-                            connection.getNatsStatistics().registerWrite(byteCount);
-                            if (rmode) {
-                                reconnectQueuedMessageCount = 0;
-                            } else {
-                                regularQueuedMessageCount = 0;
-                            }
-                        } catch (IOException io) {
-                            connection.handleCommunicationIssue(io);
-                        } finally {
-                            lock.unlock();
+                    if (mcount > 0) {
+                        ByteArrayBuilder bab = rmode ? reconnectSendBuffer : regularSendBuffer;
+                        int byteCount = bab.length();
+                        dataPort.write(bab.internalArray(), byteCount);
+                        bab.clear();
+                        connection.getNatsStatistics().registerWrite(byteCount);
+                        if (rmode) {
+                            reconnectQueuedMessageCount = 0;
                         }
-
-                        // we got messages, so reset these
-                        roundsWithoutMessages = 0;
-
-                        // check the count again
-                        mcount = rmode ? reconnectQueuedMessageCount : regularQueuedMessageCount;
+                        else {
+                            regularQueuedMessageCount = 0;
+                        }
                     }
-                }
+                    lockFlag = false;
 
-                latchRef.set(new CountDownLatch(LATCH_COUNT));
+                    //message consumed, notify waiting thread
+                    consumerFinished.signal();
+
+                } catch(InterruptedException ie) {
+                    System.out.println("Thread interrupted - consumer");
+                } finally {
+                    lock.unlock();
+                }
             }
+        } catch (IOException | BufferOverflowException io) {
+            System.out.println(io);
+            connection.handleCommunicationIssue(io);
         } catch (CancellationException | ExecutionException | InterruptedException ex) {
             System.out.println(ex);
             // Exit
@@ -162,6 +162,10 @@ public class NatsConnectionWriterLatchImpl extends NatsConnectionWriterImpl {
         lock.lock();
         try {
             //last message not consumed, wait for it be consumed
+            while (lockFlag) {
+                consumerFinished.await();
+            }
+
             long startSize = bab.length();
             msg.appendSerialized(bab);
             long added = bab.length() - startSize;
@@ -175,7 +179,14 @@ public class NatsConnectionWriterLatchImpl extends NatsConnectionWriterImpl {
             }
 
             connection.getNatsStatistics().incrementOutMsgsAndBytes(added);
-            latchRef.get().countDown();
+
+            lockFlag = true;
+
+            //new message added, notify waiting thread
+            producerFinished.signal();
+
+        } catch(InterruptedException ie) {
+            System.out.println("Thread interrupted - produce");
         } finally {
             lock.unlock();
         }

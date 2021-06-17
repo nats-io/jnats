@@ -38,7 +38,7 @@ public class TestBase {
     public static final String HAS_LOW       = "has\tlower\rthan\nspace";
     public static final String HAS_127       = "has" + (char)127 + "127";
 
-    public static final long STANDARD_CONNECTION_WAIT_MS = 5000;
+    public static final long STANDARD_CONNECTION_WAIT_MS = 10000;
     public static final long STANDARD_FLUSH_TIMEOUT_MS = 2000;
     public static final long MEDIUM_FLUSH_TIMEOUT_MS = 5000;
     public static final long LONG_TIMEOUT_MS = 15000;

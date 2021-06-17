@@ -21,12 +21,11 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReentrantLock;
 
-public class NatsConnectionWriterLatchImpl extends NatsConnectionWriterImpl {
+public class NatsConnectionWriterLatch2Impl extends NatsConnectionWriterImpl {
 
-    private static final int LATCH_AWAIT_INCREMENT = 1000;
-    private static final int LATCH_AWAIT_MAX = 60000;
+    private static final int LATCH_AWAIT_INCREMENT = 50;
     private static final int LATCH_COUNT = 1;
-    private static final int MAX_ROUNDS_NO_MESSAGES = 500_000;
+    private static final int MAX_ROUNDS_NO_MESSAGES = 200_000;
 
     private final ByteArrayBuilder regularSendBuffer;
     private final ByteArrayBuilder reconnectSendBuffer;
@@ -38,7 +37,7 @@ public class NatsConnectionWriterLatchImpl extends NatsConnectionWriterImpl {
     private final ReentrantLock lock;
     private final AtomicReference<CountDownLatch> latchRef;
 
-    NatsConnectionWriterLatchImpl(NatsConnection connection) {
+    NatsConnectionWriterLatch2Impl(NatsConnection connection) {
         super(connection);
 
         Options options = connection.getOptions();
@@ -105,6 +104,7 @@ public class NatsConnectionWriterLatchImpl extends NatsConnectionWriterImpl {
                         try {
                             ByteArrayBuilder bab = rmode ? reconnectSendBuffer : regularSendBuffer;
                             int byteCount = bab.length();
+                            System.out.println(bab.toString().replace("\r", "+").replace("\n", "+"));
                             dataPort.write(bab.internalArray(), byteCount);
                             bab.clear();
                             connection.getNatsStatistics().registerWrite(byteCount);
