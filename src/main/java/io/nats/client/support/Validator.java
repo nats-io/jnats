@@ -17,7 +17,7 @@ import io.nats.client.api.ConsumerConfiguration;
 
 import java.time.Duration;
 
-import static io.nats.client.JetStreamSubscription.MAX_PULL_SIZE;
+import static io.nats.client.support.NatsJetStreamConstants.MAX_PULL_SIZE;
 
 public abstract class Validator {
     private Validator() {} /* ensures cannot be constructed */
@@ -54,6 +54,12 @@ public abstract class Validator {
 
     public static String validateJetStreamPrefix(String s) {
         return validatePrintableExceptWildGtDollar(s, "Prefix", false);
+    }
+
+    public static void validateDirect(boolean direct, String stream, String durable) {
+        if (direct && (nullOrEmpty(stream) || nullOrEmpty(durable))) {
+            throw new IllegalArgumentException("Stream and Durable are required for direct mode.");
+        }
     }
 
     interface Check {
@@ -156,6 +162,13 @@ public abstract class Validator {
         return d;
     }
 
+    public static Duration validateDurationNotRequiredGtOrEqZero(long millis) {
+        if (millis < 0) {
+            throw new IllegalArgumentException("Duration must be greater than or equal to 0.");
+        }
+        return Duration.ofMillis(millis);
+    }
+
     public static void validateNotNull(Object o, String fieldName) {
         if (o == null) {
             throw new IllegalArgumentException(fieldName + " cannot be null");
@@ -230,5 +243,17 @@ public abstract class Validator {
 
     public static boolean zeroOrLtMinus1(long l) {
         return l == 0 || l < -1;
+    }
+
+    public static Duration ensureNotNullAndNotLessThanMin(Duration provided, Duration dflt, long minMillis)
+    {
+        return provided == null || provided.toMillis() < minMillis ? dflt : provided;
+
+    }
+
+    public static Duration ensureDurationNotLessThanMin(long providedMillis, Duration dflt, long minMillis)
+    {
+        return providedMillis < minMillis ? dflt : Duration.ofMillis(providedMillis);
+
     }
 }

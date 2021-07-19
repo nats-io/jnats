@@ -22,8 +22,8 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 
-import static io.nats.client.JetStreamSubscription.MAX_PULL_SIZE;
 import static io.nats.client.support.NatsConstants.EMPTY;
+import static io.nats.client.support.NatsJetStreamConstants.MAX_PULL_SIZE;
 import static io.nats.client.support.Validator.*;
 import static io.nats.client.utils.ResourceUtils.dataAsLines;
 import static io.nats.client.utils.TestBase.*;
@@ -163,13 +163,23 @@ public class ValidatorTests {
     @Test
     public void testValidateDurationNotRequiredGtOrEqZero() {
         assertEquals(Duration.ZERO, validateDurationNotRequiredGtOrEqZero(null));
-        assertEquals(Duration.ZERO, validateDurationNotRequiredGtOrEqZero(null));
-        assertEquals(Duration.ZERO, validateDurationNotRequiredGtOrEqZero(Duration.ZERO));
         assertEquals(Duration.ZERO, validateDurationNotRequiredGtOrEqZero(Duration.ZERO));
         assertEquals(Duration.ofNanos(1), validateDurationNotRequiredGtOrEqZero(Duration.ofNanos(1)));
-        assertEquals(Duration.ofSeconds(1), validateDurationNotRequiredGtOrEqZero(Duration.ofSeconds(1)));
         assertThrows(IllegalArgumentException.class, () -> validateDurationNotRequiredGtOrEqZero(Duration.ofNanos(-1)));
-        assertThrows(IllegalArgumentException.class, () -> validateDurationNotRequiredGtOrEqZero(Duration.ofSeconds(-1)));
+
+        assertEquals(Duration.ZERO, validateDurationNotRequiredGtOrEqZero(0));
+        assertEquals(Duration.ofMillis(1), validateDurationNotRequiredGtOrEqZero(1));
+        assertEquals(Duration.ofSeconds(1), validateDurationNotRequiredGtOrEqZero(1000));
+        assertThrows(IllegalArgumentException.class, () -> validateDurationNotRequiredGtOrEqZero(-1));
+    }
+
+    @Test
+    public void testEnsureDuration() {
+        assertEquals(Duration.ofMillis(10), ensureNotNullAndNotLessThanMin(null, Duration.ofMillis(10), 2));
+        assertEquals(Duration.ofMillis(10), ensureNotNullAndNotLessThanMin(Duration.ofMillis(1), Duration.ofMillis(10), 2));
+        assertEquals(Duration.ofMillis(100), ensureNotNullAndNotLessThanMin(Duration.ofMillis(100), Duration.ofMillis(10), 2));
+        assertEquals(Duration.ofMillis(10), ensureDurationNotLessThanMin(1, Duration.ofMillis(10), 2));
+        assertEquals(Duration.ofMillis(100), ensureDurationNotLessThanMin(100, Duration.ofMillis(10), 2));
     }
 
     @Test
